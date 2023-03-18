@@ -74,45 +74,49 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     initialize_array(A, net_size);
     initialize_array(Anew, net_size);
 
-    // Текущая ошибка
-    T error = 0;
+    // Больше 30-и ошибки быть не должно
+    T error = 30;
     // Счетчик итераций
     int iter = 0;
     // Указатель для swap
     T **temp;
-
-    std::cout.precision(4);
-
 #pragma acc data copyin(A[:net_size][:net_size], Anew[:net_size][:net_size]) copy(error)
     {
-        do
+        while (error > accuracy && ++iter < iter_max)
         {
-            error = 0.0;
-            // напомнить о массивах
+// напомнить о массивах
 #pragma acc data present(A, Anew)
+// асинхронно
+#pragma acc kernels async(1)
+            {
+// вернуть ошибку на девайс и занулить
 #pragma acc update device(error)
-#pragma acc parallel loop collapse(2) reduction(max \
-                                                : error)
-            for (int j = 1; j < net_size - 1; j++)
-                for (int i = 1; i < net_size - 1; i++)
+                error = 0;
+
+#pragma acc loop independent collapse(2) reduction(max \
+                                                   : error)
+                for (int j = 1; j < net_size - 1; j++)
                 {
-                    // Average
-                    Anew[j][i] = (A[j][i + 1] + A[j][i - 1] + A[j - 1][i] + A[j + 1][i]) * 0.25;
-                    error = MAX(error, std::abs(Anew[j][i] - A[j][i]));
+                    for (int i = 1; i < net_size - 1; i++)
+                    {
+                        Anew[i][j] = (A[i + 1][j] + A[i - 1][j] + A[i][j - 1] + A[i][j + 1]) * 0.25;
+                        error = std::max(error, std::abs(Anew[j][i] - A[j][i]));
+                    }
                 }
+            }
 
-            temp = A;
-            A = Anew;
-            Anew = temp;
+            // swap(A, Anew)
+            temp = A, A = Anew, Anew = temp;
 
-            iter++;
-#pragma acc update host(error)
-        } while (error > accuracy && iter < iter_max);
-
+// синхронизировать и отправить хосту для проверки условия
+#pragma acc wait(1)
+#pragma acc update self(error)
+        }
         if (res)
             print_array(A, net_size);
+        std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
     }
-    std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
+
     delete_2d_array(A, net_size);
     delete_2d_array(Anew, net_size);
 }
@@ -120,7 +124,7 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
 int main(int argc, char *argv[])
 {
     auto begin_main = std::chrono::steady_clock::now();
-    int net_size = 12, iter_max = 1e6;
+    int net_size = 128, iter_max = (int)1e6;
     T accuracy = 1e-6;
     bool res = false;
     for (int arg = 1; arg < argc; arg++)
