@@ -1,4 +1,4 @@
-g++ -O2 task_2.cpp -o task2_cpu -lm
+pgc++ -fast task_2.cpp -o task2_cpu
 ./task2_cpu
 pgc++ -acc=multicore -Minfo=accel -fast task_2.cpp -o task2_cpu_multicore
 ./task2_cpu_multicore
