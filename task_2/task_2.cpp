@@ -59,7 +59,7 @@ void delete_2d_array(T **A, int size)
 }
 
 // Основной алгоритм
-void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
+void calculate(int net_size = 12, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
 {
     // Создание 2-х двумерных матриц, одна будет считаться на основе другой
     T **Anew = new T *[net_size],
@@ -80,19 +80,25 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     int iter = 0;
     // Указатель для swap
     T **temp;
+    // Флаг обновления ошибки на хосте для обработки условием цикла
+    bool update_flag = true;
 #pragma acc data copyin(A[:net_size][:net_size], Anew[:net_size][:net_size]) copy(error)
     {
         while (error > accuracy && ++iter < iter_max)
         {
-// напомнить о массивах
+            // Сокращение количества обращений к CPU. Чем больше сетка, тем реже стоит сверять значения.
+            update_flag = !(iter % net_size);
+// Напомнить о массивах
 #pragma acc data present(A, Anew)
-// асинхронно
+// Асинхронно
 #pragma acc kernels async(1)
             {
-// вернуть ошибку на девайс и занулить
+                // Вернуть ошибку на девайс и занулить
+                if (update_flag)
+                {
 #pragma acc update device(error)
-                error = 0;
-
+                    error = 0;
+                }
 #pragma acc loop independent collapse(2) reduction(max \
                                                    : error)
                 for (int j = 1; j < net_size - 1; j++)
@@ -100,7 +106,8 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
                     for (int i = 1; i < net_size - 1; i++)
                     {
                         Anew[i][j] = (A[i + 1][j] + A[i - 1][j] + A[i][j - 1] + A[i][j + 1]) * 0.25;
-                        error = std::max(error, std::abs(Anew[j][i] - A[j][i]));
+                        if (update_flag)
+                            error = std::max(error, std::abs(Anew[j][i] - A[j][i]));
                     }
                 }
             }
@@ -108,14 +115,17 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
             // swap(A, Anew)
             temp = A, A = Anew, Anew = temp;
 
-// синхронизировать и отправить хосту для проверки условия
+            // Синхронизировать и отправить хосту для проверки условия
+            if (update_flag)
+            {
 #pragma acc wait(1)
 #pragma acc update self(error)
+            }
         }
         if (res)
             print_array(A, net_size);
-        std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
     }
+    std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
 
     delete_2d_array(A, net_size);
     delete_2d_array(Anew, net_size);

@@ -5,4 +5,4 @@ pgc++ -acc=multicore -Minfo=accel -fast task_2.cpp -o task2_cpu_multicore
 pgc++ -acc -Minfo=accel -fast task_2.cpp -o task2_gpu
 nvprof ./task2_gpu
 
-nsys profile -t cuda ./task2_gpu -s 128 -i 100
+nsys profile -t cuda ./task2_gpu -s 512 -i 100
