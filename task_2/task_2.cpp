@@ -15,12 +15,14 @@
 // Вывести значения двумерного массива
 void print_array(T **A, int size)
 {
-    #pragma acc update host(A[:size][:size])
-    std::cout.precision(4);
-    for (int i = 0; i < size; i += 1)
+    for (int i = 0; i < size; ++i)
     {
-        for (int j = 0; j < size; j += 1)
-            std::cout << A[i][j] << "\t";
+        for (int j = 0; j < size; ++j)
+        {
+            // Значение с GPU
+            #pragma acc kernels present(A)
+            printf("%.2f\t", A[i][j]);
+        }
         std::cout << std::endl;
     }
     std::cout << std::endl;
@@ -29,27 +31,33 @@ void print_array(T **A, int size)
 // Инициализация матрицы, чтобы подготовить ее к основному алгоритму
 void initialize_array(T **A, int size)
 {
-    // Заполнение углов матрицы значениями
-    A[0][0] = 10.0;
-    A[0][size - 1] = 20.0;
-    A[size - 1][size - 1] = 30.0;
-    A[size - 1][0] = 20.0;
-
-    // Заполнение периметра матрицы
-    T step = 10.0 / (size - 1);
-    for (int i = 1; i < size - 1; i++)
+    // Инициализируется матрица на GPU
+    #pragma acc parallel present(A)
     {
-        T addend = step * i;
-        A[0][i] = A[0][0] + addend;               // horizontal
-        A[size - 1][i] = A[size - 1][0] + addend; // horizontal
-        A[i][0] = A[0][0] + addend;               // vertical
-        A[i][size - 1] = A[0][size - 1] + addend; // vertical
-    }
+        // Заполнение углов матрицы значениями
+        A[0][0] = 10.0;
+        A[0][size - 1] = 20.0;
+        A[size - 1][size - 1] = 30.0;
+        A[size - 1][0] = 20.0;
 
-    // Заполнение 20-ю, чтобы сократить количество операций в основном алгоритме
-    for (int i = 1; i < size - 1; i++)
-        for (int j = 1; j < size - 1; j++)
-            A[i][j] = 20.0;
+        // Заполнение периметра матрицы
+        T step = 10.0 / (size - 1);
+        #pragma acc loop independent
+        for (int i = 1; i < size - 1; ++i)
+        {
+            T addend = step * i;
+            A[0][i] = A[0][0] + addend;               // horizontal
+            A[size - 1][i] = A[size - 1][0] + addend; // horizontal
+            A[i][0] = A[0][0] + addend;               // vertical
+            A[i][size - 1] = A[0][size - 1] + addend; // vertical
+        }
+
+        // Заполнение 20-ю, чтобы сократить количество операций в основном алгоритме
+        #pragma acc loop independent collapse(2)
+        for (int i = 1; i < size - 1; ++i)
+            for (int j = 1; j < size - 1; ++j)
+                A[i][j] = 20.0;
+    }
 }
 
 // Очистка динамической памяти, выделенной под двумерую матрицу
@@ -72,63 +80,66 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
         Anew[i] = new T[net_size];
     }
 
+    #pragma acc enter data create(A[:net_size][:net_size], Anew[:net_size][:net_size])
+
     // Инициализация матриц
     initialize_array(A, net_size);
     initialize_array(Anew, net_size);
 
-    // Больше 30-и ошибки быть не должно
-    T error = 30;
+    // Текущая ошибка
+    T error = 0;
     // Счетчик итераций
-    int iter = 0;
+    int iter;
     // Указатель для swap
     T **temp;
     // Флаг обновления ошибки на хосте для обработки условием цикла
     bool update_flag = true;
-    #pragma acc data copyin(A[:net_size][:net_size], Anew[:net_size][:net_size]) copy(error)
+
+    #pragma acc data copy(error)
     {
-        while (error > accuracy && iter < iter_max)
+        for (iter = 0; iter < iter_max; ++iter)
         {
-            ++iter;
-            // Сокращение количества обращений к CPU. Чем больше сетка, тем реже стоит сверять значения.
+            // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
             update_flag = !(iter % net_size);
-            // Напомнить о массивах
-            #pragma acc data present(A, Anew)
-            // Асинхронно
-            #pragma acc kernels async(1)
+
+            if (update_flag)
             {
-                // Вернуть ошибку на девайс и занулить
-                if (update_flag)
-                {
-                    #pragma acc update device(error)
-                    error = 0;
-                }
-                #pragma acc loop independent collapse(2) reduction(max : error)
+                // зануление ошибки на GPU
+                #pragma acc kernels
+                error = 0;
+            }
+
+            // Распараллелить циклы с редукцией и запустить асинхронные ядра
+            #pragma acc kernels loop independent collapse(2) reduction(max : error) present(A, Anew) async(1)
+            for (int i = 1; i < net_size - 1; i++)
                 for (int j = 1; j < net_size - 1; j++)
                 {
-                    for (int i = 1; i < net_size - 1; i++)
-                    {
-                        Anew[i][j] = (A[i + 1][j] + A[i - 1][j] + A[i][j - 1] + A[i][j + 1]) * 0.25;
-                        if (update_flag)
-                            error = std::max(error, std::abs(Anew[j][i] - A[j][i]));
-                    }
+                    Anew[i][j] = (A[i + 1][j] + A[i - 1][j] + A[i][j - 1] + A[i][j + 1]) * 0.25;
+                    // Пересчитать ошибку
+                    if (update_flag)
+                        error = std::max(error, std::abs(Anew[i][j] - A[i][j]));
                 }
-            }
 
             // swap(A, Anew)
             temp = A, A = Anew, Anew = temp;
-
-            // Синхронизировать и отправить хосту для проверки условия
+            // Проверить ошибку
             if (update_flag)
             {
-                #pragma acc wait(1)
-                #pragma acc update host(error)
+                // Синхронизация и обновление ошибки на хосте
+                #pragma acc update host(error) wait(1)
+                // Если ошибка не превышает точность, прекратить выполнение цикла
+                if (error <= accuracy)
+                    break;
             }
         }
-        if (res)
-            print_array(A, net_size);
     }
+    
+    std::cout.precision(2);
+    if (res)
+        print_array(A, net_size);
     std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
 
+    #pragma acc exit data delete (A[:net_size][:net_size], Anew[:net_size][:net_size])
     delete_2d_array(A, net_size);
     delete_2d_array(Anew, net_size);
 }
