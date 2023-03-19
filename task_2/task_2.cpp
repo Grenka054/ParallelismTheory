@@ -1,19 +1,21 @@
-#include <iostream>
-#include <cmath>
 #include <chrono>
+#include <cmath>
+#include <iostream>
 
 #ifdef _FLOAT
-#define T float
-#define MAX std::fmaxf
+    #define T float
+    #define MAX std::fmaxf
+    #define STOD std::stof
 #else
-#define T double
-#define MAX std::fmax
+    #define T double
+    #define MAX std::fmax
+    #define STOD std::stod
 #endif
 
 // Вывести значения двумерного массива
 void print_array(T **A, int size)
 {
-#pragma acc update host(A[:size][:size])
+    #pragma acc update host(A[:size][:size])
     std::cout.precision(4);
     for (int i = 0; i < size; i += 1)
     {
@@ -59,7 +61,7 @@ void delete_2d_array(T **A, int size)
 }
 
 // Основной алгоритм
-void calculate(int net_size = 12, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
+void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
 {
     // Создание 2-х двумерных матриц, одна будет считаться на основе другой
     T **Anew = new T *[net_size],
@@ -82,25 +84,25 @@ void calculate(int net_size = 12, int iter_max = 1e6, T accuracy = 1e-6, bool re
     T **temp;
     // Флаг обновления ошибки на хосте для обработки условием цикла
     bool update_flag = true;
-#pragma acc data copyin(A[:net_size][:net_size], Anew[:net_size][:net_size]) copy(error)
+    #pragma acc data copyin(A[:net_size][:net_size], Anew[:net_size][:net_size]) copy(error)
     {
-        while (error > accuracy && ++iter < iter_max)
+        while (error > accuracy && iter < iter_max)
         {
+            ++iter;
             // Сокращение количества обращений к CPU. Чем больше сетка, тем реже стоит сверять значения.
             update_flag = !(iter % net_size);
-// Напомнить о массивах
-#pragma acc data present(A, Anew)
-// Асинхронно
-#pragma acc kernels async(1)
+            // Напомнить о массивах
+            #pragma acc data present(A, Anew)
+            // Асинхронно
+            #pragma acc kernels async(1)
             {
                 // Вернуть ошибку на девайс и занулить
                 if (update_flag)
                 {
-#pragma acc update device(error)
+                    #pragma acc update device(error)
                     error = 0;
                 }
-#pragma acc loop independent collapse(2) reduction(max \
-                                                   : error)
+                #pragma acc loop independent collapse(2) reduction(max : error)
                 for (int j = 1; j < net_size - 1; j++)
                 {
                     for (int i = 1; i < net_size - 1; i++)
@@ -118,8 +120,8 @@ void calculate(int net_size = 12, int iter_max = 1e6, T accuracy = 1e-6, bool re
             // Синхронизировать и отправить хосту для проверки условия
             if (update_flag)
             {
-#pragma acc wait(1)
-#pragma acc update self(error)
+                #pragma acc wait(1)
+                #pragma acc update host(error)
             }
         }
         if (res)
@@ -140,28 +142,22 @@ int main(int argc, char *argv[])
     for (int arg = 1; arg < argc; arg++)
     {
         std::string str = argv[arg];
-        if (!str.compare("-a"))
-        {
-#ifdef _FLOAT
-            accuracy = std::stof(argv[arg + 1]);
-#else
-            accuracy = std::stod(argv[arg + 1]);
-#endif
-            arg++;
-        }
-        else if (!str.compare("-i"))
-        {
-            iter_max = (int)std::stod(argv[arg + 1]); // 1e6
-            arg++;
-        }
-        else if (!str.compare("-s"))
-        {
-            net_size = std::stoi(argv[arg + 1]);
-            arg++;
-        }
-        else if (!str.compare("-res"))
-        {
+        if (!str.compare("-res"))
             res = true;
+        else
+        {
+            arg++;
+            if (!str.compare("-a"))
+                accuracy = STOD(argv[arg]);
+            else if (!str.compare("-i"))
+                iter_max = (int)std::stod(argv[arg]);
+            else if (!str.compare("-s"))
+                net_size = std::stoi(argv[arg]);
+            else
+            {
+                std::cout << "Wrong args!";
+                return -1;
+            }
         }
     }
     calculate(net_size, iter_max, accuracy, res);
