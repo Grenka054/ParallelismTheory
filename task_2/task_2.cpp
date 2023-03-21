@@ -85,7 +85,7 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     // Инициализация матриц
     initialize_array(A, net_size);
     initialize_array(Anew, net_size);
-
+    
     // Текущая ошибка
     T error = 0;
     // Счетчик итераций
@@ -132,8 +132,9 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
                     break;
             }
         }
+        // Синхронизация
+        #pragma acc wait(1)
     }
-    
     std::cout.precision(2);
     if (res)
         print_array(A, net_size);
