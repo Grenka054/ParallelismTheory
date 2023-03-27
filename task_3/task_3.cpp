@@ -3,7 +3,9 @@
 #include <iostream>
 #include <cuda_runtime.h>
 #include "cublas_v2.h"
-
+#ifdef _NVTX
+    #include </opt/nvidia/hpc_sdk/Linux_x86_64/22.11/cuda/11.8/targets/x86_64-linux/include/nvtx3/nvToolsExt.h>
+#endif
 // Макрос индексации с 0
 #define IDX2C(i, j, ld) (((j)*(ld))+(i))
 
@@ -78,6 +80,9 @@ void initialize_array(T *A, int size)
 // Основной алгоритм
 void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
 {
+    #ifdef _NVTX
+        nvtxRangePush("Initialization");
+    #endif
     // Создаем указатель на структуру, содержащую контекст
     cublasHandle_t handle;
     // Инициализация контекста
@@ -95,6 +100,9 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     initialize_array(A, net_size);
     initialize_array(Anew, net_size);
     
+    #ifdef _NVTX
+        nvtxRangePop();
+    #endif
     // Текущая ошибка
     T error = 0;
     // Счетчик итераций
@@ -107,6 +115,9 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     const int inc = 1;
     // Индекс максимального элемента
     int max_idx = 0;
+    #ifdef _NVTX
+        nvtxRangePush("Main Algorithm");
+    #endif
     #pragma acc data copy(error)
     {
         for (iter = 0; iter < iter_max; ++iter)
@@ -146,6 +157,9 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
                 break;
         }
     }
+    #ifdef _NVTX
+        nvtxRangePop();
+    #endif
     std::cout.precision(2);
     if (res)
         print_array(A, net_size);
