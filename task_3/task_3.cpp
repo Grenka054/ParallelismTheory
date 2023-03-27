@@ -1,6 +1,11 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <cuda_runtime.h>
+#include "cublas_v2.h"
+
+// Макрос индексации с 0
+#define IDX2C(i, j, ld) (((j)*(ld))+(i))
 
 #ifdef _FLOAT
     #define T float
@@ -12,16 +17,26 @@
     #define STOD std::stod
 #endif
 
+// cublas API error checking
+#define CUBLAS_CHECK(err)                                                                          \
+    do {                                                                                           \
+        cublasStatus_t err_ = (err);                                                               \
+        if (err_ != CUBLAS_STATUS_SUCCESS) {                                                       \
+            std::printf("cublas error %d at %s:%d\n", err_, __FILE__, __LINE__);                   \
+            throw std::runtime_error("cublas error");                                              \
+        }                                                                                          \
+    } while (0)
+
 // Вывести значения двумерного массива
 void print_array(T *A, int size)
 {
-    for (int i = 0; i < size * size - 1; ++i)
+    for (int i = 0; i < size; ++i)
     {
         for (int j = 0; j < size; ++j)
         {
             // Значение с GPU
             #pragma acc kernels present(A)
-            printf("%.2f\t", A[j*size + i]);
+            printf("%.2f\t", A[IDX2C(i, j, size)]);
         }
         std::cout << std::endl;
     }
@@ -35,10 +50,10 @@ void initialize_array(T *A, int size)
     #pragma acc parallel present(A)
     {
         // Заполнение углов матрицы значениями
-        A[0] = 10.0;
-        A[(size - 1)*size + 0] = 20.0;
-        A[0*size + (size - 1)] = 20.0;
-        A[(size - 1)*size + (size - 1)] = 30.0;
+        A[IDX2C(0, 0, size)] = 10.0;
+        A[IDX2C(0, size - 1, size)] = 20.0;
+        A[IDX2C(size - 1, 0, size)] = 20.0;
+        A[IDX2C(size - 1, size - 1, size)] = 30.0;
 
         // Заполнение периметра матрицы
         T step = 10.0 / (size - 1);
@@ -46,28 +61,35 @@ void initialize_array(T *A, int size)
         for (int i = 1; i < size - 1; ++i)
         {
             T addend = step * i;
-            A[i*size + 0] = A[0] + addend;                              // horizontal
-            A[i*size + (size - 1)] = A[(size - 1)*size + 0] + addend;   // horizontal
-            A[0*size + i] = A[0] + addend;                              // vertical
-            A[(size - 1)*size + i] = A[(size - 1)*size + 0] + addend;   // vertical
+            A[IDX2C(0, i, size)] = A[IDX2C(0, 0, size)] + addend;                 // horizontal
+            A[IDX2C(size - 1, i, size)] = A[IDX2C(size - 1, 0, size)] + addend;   // horizontal
+            A[IDX2C(i, 0, size)] = A[IDX2C(0, 0, size)] + addend;                 // vertical
+            A[IDX2C(i, size - 1, size)] = A[IDX2C(0, size - 1, size)] + addend;   // vertical
         }
 
         // Заполнение 20-ю, чтобы сократить количество операций в основном алгоритме
         #pragma acc loop independent collapse(2)
         for (int i = 1; i < size - 1; ++i)
             for (int j = 1; j < size - 1; ++j)
-                A[j*size + i] = 20.0;
+                A[IDX2C(i, j, size)] = 20.0;
     }
 }
 
 // Основной алгоритм
 void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
 {
-    // Создание 2-х матриц, одна будет считаться на основе другой
-    T *Anew = new T [net_size*net_size],
-      *A = new T [net_size*net_size];
+    // Создаем указатель на структуру, содержащую контекст
+    cublasHandle_t handle;
+    // Инициализация контекста
+    CUBLAS_CHECK(cublasCreate(&handle));
+    // Размер вектора - размер сетки в квадрате
+    int vec_size = net_size * net_size;
+    // Создание 2-х матриц (векторов), одна будет считаться на основе другой. И еще одна для разности
+    T *Anew = new T [vec_size],
+      *A = new T [vec_size],
+      *Adif = new T [vec_size];
 
-    #pragma acc enter data create(A[:net_size][:net_size], Anew[:net_size][:net_size])
+    #pragma acc enter data create(A[:vec_size], Anew[:vec_size], Adif[:vec_size])
 
     // Инициализация матриц
     initialize_array(A, net_size);
@@ -79,56 +101,61 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     int iter;
     // Указатель для swap
     T *temp;
-    // Флаг обновления ошибки на хосте для обработки условием цикла
-    //bool update_flag = true;
+    // Скаляр для вычитания, cublas требует указатель, поэтому выделим и под нее память
+    const T alpha = -1;
+    // Инкремент для матриц, в этой задаче 1
+    const int inc = 1;
+    // Индекс максимального элемента
+    int max_idx = 0;
     #pragma acc data copy(error)
     {
         for (iter = 0; iter < iter_max; ++iter)
         {
-            // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
-            //update_flag = !(iter % net_size);
+            // зануление ошибки на GPU
+            #pragma acc kernels
+            error = 0;
 
-            //if (update_flag)
-            {
-                // зануление ошибки на GPU
-                #pragma acc kernels
-                error = 0;
-            }
-
-            // Распараллелить циклы с редукцией и запустить асинхронные ядра
-            #pragma acc kernels loop independent collapse(2) reduction(max : error) present(A, Anew) // async(1)
+            // Подсчет матрицы по среднему соседей в другой матрице
+            #pragma acc kernels loop independent collapse(2) present(A, Anew)
             for (int i = 1; i < net_size - 1; i++)
                 for (int j = 1; j < net_size - 1; j++)
-                {
-                    Anew[j*net_size + i] = (A[j*net_size + (i + 1)] + A[j*net_size + (i - 1)] + A[(j - 1)*net_size + i] + A[(j + 1)*net_size + i]) * 0.25;
-                    // Пересчитать ошибку
-                    //if (update_flag)
-                        error = std::max(error, std::abs(Anew[j*net_size + i] - A[j*net_size + i]));
-                }
-
+                    Anew[IDX2C(i, j, net_size)] = (A[IDX2C(i + 1, j, net_size)] + A[IDX2C(i - 1, j, net_size)]
+                                                + A[IDX2C(i, j - 1, net_size)] + A[IDX2C(i, j + 1, net_size)]) * 0.25;
             // swap(A, Anew)
             temp = A, A = Anew, Anew = temp;
             // Проверить ошибку
-            //if (update_flag)
+            #pragma acc data present(A, Anew, Adif)
             {
-                // Синхронизация и обновление ошибки на хосте
-                #pragma acc update host(error) // wait(1)
-                // Если ошибка не превышает точность, прекратить выполнение цикла
-                if (error <= accuracy)
-                    break;
+                #pragma acc host_data use_device(A, Anew, Adif)
+                {
+                    // Adif = Anew
+                    CUBLAS_CHECK(cublasDcopy(handle, vec_size, Anew, inc, Adif, inc));
+                    // Adif = -1 * A + Adif 
+                    CUBLAS_CHECK(cublasDaxpy(handle, vec_size, &alpha, A, inc, Adif, inc));
+                    // Получить индекс максимального абсолютного значения в Adif
+                    CUBLAS_CHECK(cublasIdamax(handle, vec_size, Adif, inc, &max_idx));
+
+                    #pragma acc kernels
+                    error = fabs(Adif[max_idx - 1]); // Fortran moment
+                }
             }
+            // Обновление ошибки на хосте
+            #pragma acc update host(error)
+            // Если ошибка не превышает точность, прекратить выполнение цикла
+            if (error <= accuracy)
+                break;
         }
-        // Синхронизация
-        //#pragma acc wait(1)
     }
     std::cout.precision(2);
     if (res)
         print_array(A, net_size);
     std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
 
-    #pragma acc exit data delete (A[:net_size][:net_size], Anew[:net_size][:net_size])
+    cublasDestroy(handle);
+    #pragma acc exit data delete (A[:vec_size], Anew[:vec_size], Adif[:vec_size])
     delete[] A;
     delete[] Anew;
+    delete[] Adif;
 }
 
 int main(int argc, char *argv[])
