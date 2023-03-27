@@ -3,6 +3,8 @@
 #include <iostream>
 #include <cuda_runtime.h>
 #include "cublas_v2.h"
+#include <openacc.h>
+
 #ifdef _NVTX
     #include </opt/nvidia/hpc_sdk/Linux_x86_64/22.11/cuda/11.8/targets/x86_64-linux/include/nvtx3/nvToolsExt.h>
 #endif
@@ -13,10 +15,16 @@
     #define T float
     #define MAX std::fmaxf
     #define STOD std::stof
+    #define cublascopy cublasScopy
+    #define cublasaxpy cublasSaxpy
+    #define cublasIamax cublasIsamax
 #else
     #define T double
     #define MAX std::fmax
     #define STOD std::stod
+    #define cublascopy cublasDcopy
+    #define cublasaxpy cublasDaxpy
+    #define cublasIamax cublasIdamax
 #endif
 
 // cublas API error checking
@@ -80,6 +88,7 @@ void initialize_array(T *A, int size)
 // Основной алгоритм
 void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
 {
+    acc_set_device_num(1,acc_device_default); 
     #ifdef _NVTX
         nvtxRangePush("Initialization");
     #endif
@@ -89,6 +98,8 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     CUBLAS_CHECK(cublasCreate(&handle));
     // Размер вектора - размер сетки в квадрате
     int vec_size = net_size * net_size;
+    // Флаг обновления ошибки на хосте для обработки условием цикла
+    bool update_flag = true;
     // Создание 2-х матриц (векторов), одна будет считаться на основе другой. И еще одна для разности
     T *Anew = new T [vec_size],
       *A = new T [vec_size],
@@ -118,35 +129,38 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     #ifdef _NVTX
         nvtxRangePush("Main Algorithm");
     #endif
-    #pragma acc data copy(error)
+    #pragma acc enter data copyin(error)
+    for (iter = 0; iter < iter_max; ++iter)
     {
-        for (iter = 0; iter < iter_max; ++iter)
-        {
-            // зануление ошибки на GPU
-            #pragma acc kernels
-            error = 0;
+        // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
+        update_flag = !(iter % net_size);
+        // зануление ошибки на GPU
+        #pragma acc kernels present(error)
+        error = 0;
 
-            // Подсчет матрицы по среднему соседей в другой матрице
-            #pragma acc kernels loop independent collapse(2) present(A, Anew)
-            for (int i = 1; i < net_size - 1; i++)
-                for (int j = 1; j < net_size - 1; j++)
-                    Anew[IDX2C(i, j, net_size)] = (A[IDX2C(i + 1, j, net_size)] + A[IDX2C(i - 1, j, net_size)]
-                                                + A[IDX2C(i, j - 1, net_size)] + A[IDX2C(i, j + 1, net_size)]) * 0.25;
-            // swap(A, Anew)
-            temp = A, A = Anew, Anew = temp;
-            // Проверить ошибку
-            #pragma acc data present(A, Anew, Adif)
+        // Подсчет матрицы по среднему соседей в другой матрице
+        #pragma acc kernels loop independent collapse(2) present(A, Anew) async(1)
+        for (int i = 1; i < net_size - 1; i++)
+            for (int j = 1; j < net_size - 1; j++)
+                Anew[IDX2C(i, j, net_size)] = (A[IDX2C(i + 1, j, net_size)] + A[IDX2C(i - 1, j, net_size)]
+                                            + A[IDX2C(i, j - 1, net_size)] + A[IDX2C(i, j + 1, net_size)]) * 0.25;
+        // swap(A, Anew)
+        temp = A, A = Anew, Anew = temp;
+        // Проверить ошибку
+        if (update_flag)
+        {
+            #pragma acc data present(A, Anew, Adif) wait(1)
             {
                 #pragma acc host_data use_device(A, Anew, Adif)
                 {
                     // Adif = Anew
-                    CUBLAS_CHECK(cublasDcopy(handle, vec_size, Anew, inc, Adif, inc));
+                    CUBLAS_CHECK(cublascopy(handle, vec_size, Anew, inc, Adif, inc));
                     // Adif = -1 * A + Adif 
-                    CUBLAS_CHECK(cublasDaxpy(handle, vec_size, &alpha, A, inc, Adif, inc));
+                    CUBLAS_CHECK(cublasaxpy(handle, vec_size, &alpha, A, inc, Adif, inc));
                     // Получить индекс максимального абсолютного значения в Adif
-                    CUBLAS_CHECK(cublasIdamax(handle, vec_size, Adif, inc, &max_idx));
+                    CUBLAS_CHECK(cublasIamax(handle, vec_size, Adif, inc, &max_idx));
 
-                    #pragma acc kernels
+                    #pragma acc kernels present(error)
                     error = fabs(Adif[max_idx - 1]); // Fortran moment
                 }
             }
@@ -157,6 +171,9 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
                 break;
         }
     }
+    // Синхронизация
+    #pragma acc wait(1)
+    
     #ifdef _NVTX
         nvtxRangePop();
     #endif
@@ -166,7 +183,7 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
 
     cublasDestroy(handle);
-    #pragma acc exit data delete (A[:vec_size], Anew[:vec_size], Adif[:vec_size])
+    #pragma acc exit data delete (A[:vec_size], Anew[:vec_size], Adif[:vec_size], error)
     delete[] A;
     delete[] Anew;
     delete[] Adif;
