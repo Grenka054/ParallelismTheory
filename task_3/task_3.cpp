@@ -88,7 +88,7 @@ void initialize_array(T *A, int size)
 // Основной алгоритм
 void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
 {
-    acc_set_device_num(1,acc_device_default); 
+    acc_set_device_num(2,acc_device_default); 
     #ifdef _NVTX
         nvtxRangePush("Initialization");
     #endif
@@ -134,9 +134,6 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     {
         // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
         update_flag = !(iter % net_size);
-        // зануление ошибки на GPU
-        #pragma acc kernels present(error)
-        error = 0;
 
         // Подсчет матрицы по среднему соседей в другой матрице
         #pragma acc kernels loop independent collapse(2) present(A, Anew) async(1)
@@ -149,6 +146,9 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
         // Проверить ошибку
         if (update_flag)
         {
+            // зануление ошибки на GPU
+            #pragma acc kernels present(error)
+            error = 0;
             #pragma acc data present(A, Anew, Adif) wait(1)
             {
                 #pragma acc host_data use_device(A, Anew, Adif)
