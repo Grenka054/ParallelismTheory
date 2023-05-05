@@ -113,18 +113,17 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
             #pragma acc kernels loop independent collapse(2) reduction(max : error) present(A, Anew) async(1)
             for (int i = 1; i < net_size - 1; i++)
                 for (int j = 1; j < net_size - 1; j++)
-                {
                     Anew[i][j] = (A[i + 1][j] + A[i - 1][j] + A[i][j - 1] + A[i][j + 1]) * 0.25;
-                    // Пересчитать ошибку
-                    if (update_flag)
-                        error = std::max(error, std::abs(Anew[i][j] - A[i][j]));
-                }
 
             // swap(A, Anew)
             temp = A, A = Anew, Anew = temp;
             // Проверить ошибку
             if (update_flag)
             {
+                for (int i = 1; i < net_size - 1; i++)
+                    for (int j = 1; j < net_size - 1; j++)
+                        // Пересчитать ошибку
+                        error = std::max(error, std::abs(Anew[i][j] - A[i][j]));
                 // Синхронизация и обновление ошибки на хосте
                 #pragma acc update host(error) wait(1)
                 // Если ошибка не превышает точность, прекратить выполнение цикла
