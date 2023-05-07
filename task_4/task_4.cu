@@ -129,7 +129,7 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     T *reduction_bufer = NULL;
     size_t reduction_bufer_size = 0;
 
-    // Получить размер буфера
+    // Первый вызов, чтобы предоставить количество байтов, необходимое для временного хранения, необходимого CUB.
     cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err, error_dev, vec_size);
 
     // Выделение памяти под буфер
