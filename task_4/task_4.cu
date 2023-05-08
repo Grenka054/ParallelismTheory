@@ -19,6 +19,17 @@
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
 
+// Макрос проверки статуса операции CUDA
+#define CUDA_CHECK(err) {                                                       \
+        cudaError_t err_ = (err);                                               \
+        if (err_ != cudaSuccess) {                                              \
+            std::printf("CUDA error %d at %s:%d\n", err_, __FILE__, __LINE__);  \
+            throw std::runtime_error("cublas error");                           \
+        }                                                                       \
+}
+
+
+// Вывести свойства девайса
 void print_device_properties(void)
 {
     cudaDeviceProp deviceProp;
@@ -51,7 +62,7 @@ __global__ void calculate_matrix(T *Anew, T *A, uint32_t size)
     uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
     uint32_t j = blockDim.y * blockIdx.y + threadIdx.y;
 
-    // Выход за границы массива или периметр - ничего не делать
+    // Граница или выход за границы массива - ничего не делать
     if (i >= size - 1 || j >= size - 1 || i == 0 || j == 0)
         return;
 
@@ -97,25 +108,31 @@ void initialize_array(T *A, int size)
 // Основной алгоритм
 void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
 {
-    cudaSetDevice(2);
+    CUDA_CHECK(cudaSetDevice(2));
+
     // Размер вектора - размер сетки в квадрате
-    int vec_size = net_size * net_size;
+    uint32_t vec_size = net_size * net_size;
 
     // Матрица на хосте (нужна только для инициализации и вывода) [Pinned]
     T *A;
-    cudaMallocHost(&A, sizeof(T) * vec_size);    
+
+    CUDA_CHECK(cudaMallocHost(&A, sizeof(T) * vec_size));
 
     // Инициализация матрицы
     initialize_array(A, net_size);
 
     // Создание 2-х матриц на девайсе
     T *A_dev, *Anew_dev;
-    cudaMalloc(&A_dev, sizeof(T) * vec_size);    // Матрица
-    cudaMalloc(&Anew_dev, sizeof(T) * vec_size); // Еще одна матрица
+    CUDA_CHECK(cudaMalloc(&A_dev, sizeof(T) * vec_size));
+    CUDA_CHECK(cudaMalloc(&Anew_dev, sizeof(T) * vec_size));
+    
+    // Поток для копирования
+    cudaStream_t memory_stream;
+    CUDA_CHECK(cudaStreamCreate(&memory_stream));
 
     // Скопировать матрицу с хоста на матрицы на девайсе
-    cudaMemcpyAsync(A_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice);
-    cudaMemcpyAsync(Anew_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpyAsync(A_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice, memory_stream));
+    CUDA_CHECK(cudaMemcpyAsync(Anew_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice, memory_stream));
 
     // Вывод
     if (res)
@@ -123,36 +140,39 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
 
     // Текущая ошибка
     T *error, *error_dev;
-    cudaMallocHost(&error, sizeof(T));
-    cudaMalloc(&error_dev, sizeof(T));
+    CUDA_CHECK(cudaMallocHost(&error, sizeof(T)));
+    CUDA_CHECK(cudaMalloc(&error_dev, sizeof(T)));
     *error = accuracy + 1;
 
     // Матрица ошибок
     T *A_err;
-    cudaMalloc(&A_err, sizeof(T) * vec_size);
+    CUDA_CHECK(cudaMalloc(&A_err, sizeof(T) * vec_size));
 
     // Временный буфер для редукции и его размер
     T *reduction_bufer = NULL;
-    size_t reduction_bufer_size = 0;
+    uint64_t reduction_bufer_size = 0;
 
     // Первый вызов, чтобы предоставить количество байтов, необходимое для временного хранения, необходимого CUB.
     cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err, error_dev, vec_size);
 
     // Выделение памяти под буфер
-    cudaMalloc(&reduction_bufer, reduction_bufer_size);
+    CUDA_CHECK(cudaMalloc(&reduction_bufer, reduction_bufer_size));
 
-    int threads_in_block = MIN(net_size, 32); // Потоков в одном блоке (32 * 32 максимум)
-    int block_in_grid = ceil(net_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
-
+    uint32_t threads_in_block = MIN(net_size, 32); // Потоков в одном блоке (32 * 32 максимум)
+    uint32_t block_in_grid = ceil((double)net_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
+ 
     // Граф
     cudaGraph_t graph;
     cudaGraphExec_t instance;
-    cudaStream_t stream, memoryStream;
-    cudaStreamCreate(&stream);
-    cudaStreamCreate(&memoryStream);
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
 
-    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-    for (uint32_t i = 0; i < net_size; i += 2)
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    
+    // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
+    uint32_t num_skipped_checks = (iter_max < net_size) ? iter_max : net_size;
+    num_skipped_checks += num_skipped_checks % 2; // Привести к четному числу
+    for (uint32_t i = 0; i < num_skipped_checks; i += 2)
     {
         calculate_matrix<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block), 0, stream>>>(A_dev, Anew_dev, net_size);
         calculate_matrix<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block), 0, stream>>>(Anew_dev, A_dev, net_size);
@@ -161,47 +181,46 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
 
     // Найти максимум и положить в error_dev - аналог reduction (max : error_dev) в OpenACC
     cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err, error_dev, vec_size, stream);
-    cudaStreamEndCapture(stream, &graph);
-    cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&instance, graph, NULL, NULL, 0));
 
     // Счетчик итераций
     int iter = 0;
     
     while (iter < iter_max && *error > accuracy)
     {
-        // Заупск графа
-        cudaGraphLaunch(instance, stream);
+        // Запуск графа
+        CUDA_CHECK(cudaGraphLaunch(instance, stream));
 
         // Синхронизация потока
-        cudaStreamSynchronize(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // Копировать ошибку с девайса на хост
-        cudaMemcpyAsync(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost, memoryStream);
+        CUDA_CHECK(cudaMemcpyAsync(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost, memory_stream));
 
-        // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
-        iter += (net_size + 1) % 2;
+        iter += num_skipped_checks;
     }
 
     std::cout.precision(2);
     // Вывод
     if (res)
     {
-        cudaMemcpyAsync(A, A_dev, sizeof(T) * vec_size, cudaMemcpyDeviceToHost, memoryStream);
+        CUDA_CHECK(cudaMemcpyAsync(A, A_dev, sizeof(T) * vec_size, cudaMemcpyDeviceToHost, memory_stream));
         print_array(A, net_size);
     }
     std::cout << "iter=" << iter << ",\terror=" << *error << std::endl;
 
     // Освобождение памяти
-    cudaFree(reduction_bufer);
-    cudaFree(A_err);
-    cudaFree(A_dev);
-    cudaFree(Anew_dev);
-    cudaFreeHost(A);
-    cudaFreeHost(error);
+    CUDA_CHECK(cudaFree(reduction_bufer));
+    CUDA_CHECK(cudaFree(A_err));
+    CUDA_CHECK(cudaFree(A_dev));
+    CUDA_CHECK(cudaFree(Anew_dev));
+    CUDA_CHECK(cudaFreeHost(A));
+    CUDA_CHECK(cudaFreeHost(error));
 
-    cudaStreamDestroy(stream);
-    cudaStreamDestroy(memoryStream);
-    cudaGraphDestroy(graph);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaStreamDestroy(memory_stream));
+    CUDA_CHECK(cudaGraphDestroy(graph));
 }
 
 int main(int argc, char *argv[])
@@ -227,16 +246,16 @@ int main(int argc, char *argv[])
             else if (!str.compare("-s"))
             {
                 net_size = std::stoi(argv[arg]);
-                if(net_size > 37000)
+                if(net_size > 37000) // 4 GM Memory Max
                 {
                     std::cout << "Too big size!\n";
-                    return -2;
+                    return 20;
                 }
             }
             else
             {
                 std::cout << "Wrong args!\n";
-                return -1;
+                return 100;
             }
         }
     }
