@@ -97,7 +97,7 @@ void initialize_array(T *A, int size)
 // Основной алгоритм
 void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
 {
-    cudaSetDevice(3);
+    cudaSetDevice(2);
     // Размер вектора - размер сетки в квадрате
     int vec_size = net_size * net_size;
 
@@ -114,28 +114,22 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     cudaMalloc(&Anew_dev, sizeof(T) * vec_size); // Еще одна матрица
 
     // Скопировать матрицу с хоста на матрицы на девайсе
-    cudaMemcpy(A_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(Anew_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(A_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(Anew_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice);
 
     // Вывод
     if (res)
-    {
-        cudaMemcpy(A, A_dev, sizeof(T) * vec_size, cudaMemcpyDeviceToHost);
         print_array(A, net_size);
-    }
 
     // Текущая ошибка
     T *error, *error_dev;
     cudaMallocHost(&error, sizeof(T));
-    cudaMalloc(&error_dev, sizeof(T));        // Ошибка (переменная)
-    *error = 0;
+    cudaMalloc(&error_dev, sizeof(T));
+    *error = accuracy + 1;
 
     // Матрица ошибок
     T *A_err;
-    cudaMalloc(&A_err, sizeof(T) * vec_size); // Матрица ошибок
-
-    // Указатель для swap
-    T *temp;
+    cudaMalloc(&A_err, sizeof(T) * vec_size);
 
     // Временный буфер для редукции и его размер
     T *reduction_bufer = NULL;
@@ -147,47 +141,52 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     // Выделение памяти под буфер
     cudaMalloc(&reduction_bufer, reduction_bufer_size);
 
-    // Флаг обновления ошибки на хосте для обработки условием цикла
-    bool update_flag = true;
-
     int threads_in_block = MIN(net_size, 32); // Потоков в одном блоке (32 * 32 максимум)
     int block_in_grid = ceil(net_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
 
-    // Счетчик итераций
-    int iter;
-    
-    for (iter = 0; iter < iter_max; ++iter)
+    // Граф
+    cudaGraph_t graph;
+    cudaGraphExec_t instance;
+    cudaStream_t stream, memoryStream;
+    cudaStreamCreate(&stream);
+    cudaStreamCreate(&memoryStream);
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    for (uint32_t i = 0; i < net_size; i += 2)
     {
+        calculate_matrix<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block), 0, stream>>>(A_dev, Anew_dev, net_size);
+        calculate_matrix<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block), 0, stream>>>(Anew_dev, A_dev, net_size);
+    }
+    count_matrix_difference<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block), 0, stream>>>(A_dev, Anew_dev, A_err, net_size);
+
+    // Найти максимум и положить в error_dev - аналог reduction (max : error_dev) в OpenACC
+    cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err, error_dev, vec_size, stream);
+    cudaStreamEndCapture(stream, &graph);
+    cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);
+
+    // Счетчик итераций
+    int iter = 0;
+    
+    while (iter < iter_max && *error > accuracy)
+    {
+        // Заупск графа
+        cudaGraphLaunch(instance, stream);
+
+        // Синхронизация потока
+        cudaStreamSynchronize(stream);
+
+        // Копировать ошибку с девайса на хост
+        cudaMemcpyAsync(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost, memoryStream);
+
         // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
-        update_flag = !(iter % net_size);
-
-        calculate_matrix<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block)>>>(Anew_dev, A_dev, net_size);
-
-        // swap(A_dev, Anew_dev)
-        temp = A_dev, A_dev = Anew_dev, Anew_dev = temp;
-
-        // Проверить ошибку
-        if (update_flag)
-        {
-            count_matrix_difference<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block)>>>(A_dev, Anew_dev, A_err, net_size);
-
-            // Найти максимум и положить в error_dev - аналог reduction (max : error_dev) в OpenACC
-            cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err, error_dev, vec_size);
-
-            // Копировать ошибку с девайса на хост
-            cudaMemcpy(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost);
-
-            // Если ошибка не превышает точность, прекратить выполнение цикла
-            if (*error <= accuracy)
-                break;
-        }
+        iter += (net_size + 1) % 2;
     }
 
     std::cout.precision(2);
     // Вывод
     if (res)
     {
-        cudaMemcpy(A, A_dev, sizeof(T) * vec_size, cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(A, A_dev, sizeof(T) * vec_size, cudaMemcpyDeviceToHost, memoryStream);
         print_array(A, net_size);
     }
     std::cout << "iter=" << iter << ",\terror=" << *error << std::endl;
@@ -199,6 +198,10 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     cudaFree(Anew_dev);
     cudaFreeHost(A);
     cudaFreeHost(error);
+
+    cudaStreamDestroy(stream);
+    cudaStreamDestroy(memoryStream);
+    cudaGraphDestroy(graph);
 }
 
 int main(int argc, char *argv[])
@@ -232,7 +235,7 @@ int main(int argc, char *argv[])
             }
             else
             {
-                std::cout << "Wrong args!";
+                std::cout << "Wrong args!\n";
                 return -1;
             }
         }
