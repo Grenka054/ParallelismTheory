@@ -225,8 +225,10 @@ int main(int argc, char *argv[])
             {
                 net_size = std::stoi(argv[arg]);
                 if(net_size > 37000)
-                std::cout << "Too big size!";
-                return -2;
+                {
+                    std::cout << "Too big size!\n";
+                    return -2;
+                }
             }
             else
             {
