@@ -24,7 +24,7 @@
         cudaError_t err_ = (err);                                               \
         if (err_ != cudaSuccess) {                                              \
             std::printf("CUDA error %d at %s:%d\n", err_, __FILE__, __LINE__);  \
-            throw std::runtime_error("cublas error");                           \
+            throw std::runtime_error("CUDA error");                             \
         }                                                                       \
 }
 
@@ -86,6 +86,10 @@ __global__ void count_matrix_difference(T *matrixA, T *matrixB, T *outputMatrix,
 // Инициализация матрицы, чтобы подготовить ее к основному алгоритму
 void initialize_array(T *A, int size)
 {
+    // Зануление массива
+    for (uint32_t i = 0; i < size * size; ++i)
+        A[i] = 0;
+    
     // Заполнение углов матрицы значениями
     A[IDX2C(0, 0, size)] = 10.0;
     A[IDX2C(0, size - 1, size)] = 20.0;
@@ -172,6 +176,7 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
     uint32_t num_skipped_checks = (iter_max < net_size) ? iter_max : net_size;
     num_skipped_checks += num_skipped_checks % 2; // Привести к четному числу
+
     for (uint32_t i = 0; i < num_skipped_checks; i += 2)
     {
         calculate_matrix<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block), 0, stream>>>(A_dev, Anew_dev, net_size);
@@ -194,14 +199,15 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
 
         // Синхронизация потока
         CUDA_CHECK(cudaStreamSynchronize(stream));
-
+        
         // Копировать ошибку с девайса на хост
         CUDA_CHECK(cudaMemcpyAsync(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost, memory_stream));
 
         iter += num_skipped_checks;
     }
-
+    
     std::cout.precision(2);
+
     // Вывод
     if (res)
     {
