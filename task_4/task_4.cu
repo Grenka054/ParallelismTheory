@@ -151,7 +151,7 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     bool update_flag = true;
 
     int threads_in_block = MIN(net_size, 32); // Потоков в одном блоке (32 * 32 максимум)
-    int block_in_grid = ceil(net_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
+    int block_in_grid = ceil((double)net_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
 
     // Счетчик итераций
     int iter;
