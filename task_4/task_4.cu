@@ -222,7 +222,12 @@ int main(int argc, char *argv[])
             else if (!str.compare("-i"))
                 iter_max = (int)std::stod(argv[arg]);
             else if (!str.compare("-s"))
+            {
                 net_size = std::stoi(argv[arg]);
+                if(net_size > 37000)
+                std::cout << "Too big size!";
+                return -2;
+            }
             else
             {
                 std::cout << "Wrong args!";
