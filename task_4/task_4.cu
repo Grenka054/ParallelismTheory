@@ -1,12 +1,3 @@
-/*
-    На хосте только один массив, потому что второй
-    временный, и он уже есть на девайсе.
-
-    net_size - 2 потоков, поскольку при расчете
-    не используется периметр, и я решил не создавать
-    потоков, которые ничего полезного не делают.
-*/
-
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -26,6 +17,22 @@
 // Макрос индексации с 0
 #define IDX2C(i, j, ld) (((j) * (ld)) + (i))
 
+#define MIN(a,b) (((a)<(b))?(a):(b))
+
+void print_device_properties(void)
+{
+    cudaDeviceProp deviceProp;
+    if (cudaSuccess == cudaGetDeviceProperties(&deviceProp, 0))
+    {
+        printf("Warp size in threads is %d.\n", deviceProp.warpSize);
+        printf("Maximum size of each dimension of a block is %d, %d, %d.\n", deviceProp.maxThreadsDim[0], deviceProp.maxThreadsDim[1], deviceProp.maxThreadsDim[2]);
+        printf("Maximum size of each dimension of a grid is %d, %d, %d.\n", deviceProp.maxGridSize[0], deviceProp.maxGridSize[1], deviceProp.maxGridSize[2]);
+        printf("Maximum resident threads per multiprocessor is %d.\n", deviceProp.maxThreadsPerMultiProcessor);
+        printf("Maximum number of resident blocks per multiprocessor is %d.\n", deviceProp.maxBlocksPerMultiProcessor);
+        printf("_____________________________________________________________________________________________\n");
+    }
+}
+
 // Вывести значения двумерного массива
 void print_array(T *A, int size)
 {
@@ -39,13 +46,13 @@ void print_array(T *A, int size)
 }
 
 // Посчитать матрицу
-__global__ void calculate_matrix(T *A, T *Anew, uint32_t size)
+__global__ void calculate_matrix(T *Anew, T *A, uint32_t size)
 {
-    uint32_t i = blockIdx.x + 1;
-    uint32_t j = threadIdx.x + 1;
+    uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+    uint32_t j = blockDim.y * blockIdx.y + threadIdx.y;
 
     // Выход за границы массива или периметр - ничего не делать
-    if (i > size - 2 || j > size - 2)
+    if (i >= size - 1 || j >= size - 1 || i == 0 || j == 0)
         return;
 
     Anew[IDX2C(i, j, size)] = (A[IDX2C(i + 1, j, size)] + A[IDX2C(i - 1, j, size)] + A[IDX2C(i, j - 1, size)] + A[IDX2C(i, j + 1, size)]) * 0.25;
@@ -54,14 +61,14 @@ __global__ void calculate_matrix(T *A, T *Anew, uint32_t size)
 // O = |A-B|
 __global__ void count_matrix_difference(T *matrixA, T *matrixB, T *outputMatrix, uint32_t size)
 {
-    uint32_t i = blockIdx.x + 1;
-    uint32_t j = threadIdx.x + 1;
+    uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+    uint32_t j = blockDim.y * blockIdx.y + threadIdx.y;
 
     // Выход за границы массива или периметр - ничего не делать
-    if (i > size - 2 || j > size - 2)
+    if (i >= size - 1 || j >= size - 1 || i == 0 || j == 0)
         return;
 
-    uint32_t idx = IDX2C(i, j, blockDim.x);
+    uint32_t idx = IDX2C(i, j, size);
     outputMatrix[idx] = std::abs(matrixB[idx] - matrixA[idx]);
 }
 
@@ -94,16 +101,19 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     // Размер вектора - размер сетки в квадрате
     int vec_size = net_size * net_size;
 
-    // Создание матрицы на хосте и 2-х на девайсе
-    T *A, *A_dev, *Anew_dev;
-    A = new T[vec_size];
+    // Матрица на хосте (нужна только для инициализации и вывода) [Pinned]
+    T *A;
+    cudaMallocHost(&A, sizeof(T) * vec_size);    
+
+    // Инициализация матрицы
+    initialize_array(A, net_size);
+
+    // Создание 2-х матриц на девайсе
+    T *A_dev, *Anew_dev;
     cudaMalloc(&A_dev, sizeof(T) * vec_size);    // Матрица
     cudaMalloc(&Anew_dev, sizeof(T) * vec_size); // Еще одна матрица
 
-    // Инициализация матриц
-    initialize_array(A, net_size);
-
-    // Скопировать заполненные массивы с хоста на девайс
+    // Скопировать матрицу с хоста на матрицы на девайсе
     cudaMemcpy(A_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice);
     cudaMemcpy(Anew_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice);
 
@@ -114,12 +124,14 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
         print_array(A, net_size);
     }
 
-    // Текущая ошибка и матрица ошибок
-    T error = 0;
-    T *error_dev, *A_err;
-
-    // Выделение памяти на девайсе
+    // Текущая ошибка
+    T *error, *error_dev;
+    cudaMallocHost(&error, sizeof(T));
     cudaMalloc(&error_dev, sizeof(T));        // Ошибка (переменная)
+    *error = 0;
+
+    // Матрица ошибок
+    T *A_err;
     cudaMalloc(&A_err, sizeof(T) * vec_size); // Матрица ошибок
 
     // Указатель для swap
@@ -138,15 +150,18 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
     // Флаг обновления ошибки на хосте для обработки условием цикла
     bool update_flag = true;
 
+    int threads_in_block = MIN(net_size, 32); // Потоков в одном блоке (32 * 32 максимум)
+    int block_in_grid = ceil(net_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
+
     // Счетчик итераций
     int iter;
-
+    
     for (iter = 0; iter < iter_max; ++iter)
     {
         // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
         update_flag = !(iter % net_size);
 
-        calculate_matrix<<<net_size - 2, net_size - 2>>>(A_dev, Anew_dev, net_size);
+        calculate_matrix<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block)>>>(Anew_dev, A_dev, net_size);
 
         // swap(A_dev, Anew_dev)
         temp = A_dev, A_dev = Anew_dev, Anew_dev = temp;
@@ -154,16 +169,16 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
         // Проверить ошибку
         if (update_flag)
         {
-            count_matrix_difference<<<net_size - 2, net_size - 2>>>(A_dev, Anew_dev, A_err, net_size);
+            count_matrix_difference<<<dim3(block_in_grid,block_in_grid), dim3(threads_in_block,threads_in_block)>>>(A_dev, Anew_dev, A_err, net_size);
 
             // Найти максимум и положить в error_dev - аналог reduction (max : error_dev) в OpenACC
             cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err, error_dev, vec_size);
 
             // Копировать ошибку с девайса на хост
-            cudaMemcpy(&error, error_dev, sizeof(T), cudaMemcpyDeviceToHost);
+            cudaMemcpy(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost);
 
             // Если ошибка не превышает точность, прекратить выполнение цикла
-            if (error <= accuracy)
+            if (*error <= accuracy)
                 break;
         }
     }
@@ -175,14 +190,15 @@ void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool r
         cudaMemcpy(A, A_dev, sizeof(T) * vec_size, cudaMemcpyDeviceToHost);
         print_array(A, net_size);
     }
-    std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
+    std::cout << "iter=" << iter << ",\terror=" << *error << std::endl;
 
     // Освобождение памяти
     cudaFree(reduction_bufer);
     cudaFree(A_err);
     cudaFree(A_dev);
     cudaFree(Anew_dev);
-    free(A);
+    cudaFreeHost(A);
+    cudaFreeHost(error);
 }
 
 int main(int argc, char *argv[])
