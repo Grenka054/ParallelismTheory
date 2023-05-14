@@ -1,15 +1,10 @@
-#include <chrono>
-#include <cmath>
 #include <iostream>
+#include <cstring>
+#include <cmath>
+#include <chrono>
+#include <openacc.h>
 #include <cuda_runtime.h>
 #include "cublas_v2.h"
-#include <openacc.h>
-
-#ifdef _NVTX
-    #include </opt/nvidia/hpc_sdk/Linux_x86_64/22.11/cuda/11.8/targets/x86_64-linux/include/nvtx3/nvToolsExt.h>
-#endif
-// Макрос индексации с 0
-#define IDX2C(i, j, ld) (((j)*(ld))+(i))
 
 #ifdef _FLOAT
     #define T float
@@ -27,18 +22,21 @@
     #define cublasIamax cublasIdamax
 #endif
 
+// Макрос индексации с 0
+#define IDX2C(i, j, ld) (((j)*(ld))+(i))
+
 // cublas API error checking
 #define CUBLAS_CHECK(err)                                                                          \
-    do {                                                                                           \
+    {                                                                                              \
         cublasStatus_t err_ = (err);                                                               \
         if (err_ != CUBLAS_STATUS_SUCCESS) {                                                       \
             std::printf("cublas error %d at %s:%d\n", err_, __FILE__, __LINE__);                   \
             throw std::runtime_error("cublas error");                                              \
         }                                                                                          \
-    } while (0)
+    }
 
-// Вывести значения двумерного массива
-void print_array(T *A, int size)
+// Вывести значения двумерного массива на gpu
+void print_array_gpu(T *A, int size)
 {
     for (int i = 0; i < size; ++i)
     {
@@ -72,124 +70,103 @@ void initialize_array(T *A, int size)
         A[IDX2C(i, 0, size)] = A[IDX2C(0, 0, size)] + addend;                 // vertical
         A[IDX2C(i, size - 1, size)] = A[IDX2C(0, size - 1, size)] + addend;   // vertical
     }
-
-    //Заполнение 20-ю, чтобы сократить количество операций в основном алгоритме
-    for (int i = 1; i < size - 1; ++i)
-        for (int j = 1; j < size - 1; ++j)
-            A[IDX2C(i, j, size)] = 20.0;
 }
 
-// Основной алгоритм
-void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
+void calculate(const int net_size = 128, const int iter_max = 1e6, const T accuracy = 1e-6, const bool res = false)
 {
-    //acc_set_device_num(2,acc_device_default); 
-    #ifdef _NVTX
-        nvtxRangePush("Initialization");
-    #endif
-    // Размер вектора - размер сетки в квадрате
-    int vec_size = net_size * net_size;
-    // Флаг обновления ошибки на хосте для обработки условием цикла
-    bool update_flag = true;
-    // Создание 2-х матриц (векторов), одна будет считаться на основе другой. И еще одна для разности
-    T *Anew = new T [vec_size],
-      *A = new T [vec_size];
-    T *Adif = (T*)acc_malloc(sizeof(T) * vec_size);
-    // Инициализация матриц
-    initialize_array(A, net_size);
-    initialize_array(Anew, net_size);
-    #ifdef _NVTX
-        nvtxRangePop();
-    #endif
-    // Текущая ошибка
-    T error = 0;
-    // Счетчик итераций
-    int iter;
-    // Указатель для swap
-    T *temp;
+	const size_t vec_size = net_size * net_size;
+
+	// Создание 2-х двумерных матриц, одна будет считаться на основе другой
+  	T* A = new T[vec_size],
+	*Anew = new T[vec_size],
+    * Adif = new T[vec_size];
+
+	// Инициализация матриц
+	std::memset(A, 0, vec_size * sizeof(T));
+	initialize_array(A, net_size);
+    std::memcpy(Anew, A, vec_size * sizeof(T));
     // Скаляр для вычитания, cublas требует указатель, поэтому выделим и под нее память
     const T alpha = -1;
+
     // Инкремент для матриц, в этой задаче 1
     const int inc = 1;
+
     // Индекс максимального элемента
     int max_idx = 0;
-    #ifdef _NVTX
-        nvtxRangePush("Main Algorithm");
-    #endif
-    // Создаем указатель на структуру, содержащую контекст
+
+	// Текущая ошибка
+    T error = accuracy + 1;
+
+    // Указатель для swap
+    T *temp;
+
+    // Указатель на структуру, содержащую контекст
     cublasHandle_t handle;
+
     // Инициализация контекста
     CUBLAS_CHECK(cublasCreate(&handle));
-    #pragma acc enter data copyin(A[:vec_size], Anew[:vec_size], error)
-    if (res)
-    {
-        std::cout << "--Borders--" << std::endl;
-        print_array(A, net_size);
-    }
-    for (iter = 0; iter < iter_max; ++iter)
+
+	// Счетчик итераций
+    int iter = 0;
+
+	// Скопировать данные на девайс
+	#pragma acc enter data copyin(A[:vec_size], Anew[:vec_size]) create(Adif[:vec_size])
+    
+    // // Вывести матрицу до начала основного алгоритма
+    // if (res)
+    // {
+    //     std::cout << "--Borders--" << std::endl;
+    //     print_array_gpu(A, net_size);
+    // }
+
+    for (iter = 0; iter < iter_max && error > accuracy; iter += net_size)
     {
         // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
-        update_flag = !(iter % net_size);
-
-        // Подсчет матрицы по среднему соседей в другой матрице
-        #pragma acc kernels loop independent collapse(2) present(A, Anew) vector_length(128) async(1)
-        for (int i = 1; i < net_size - 1; i++)
-            for (int j = 1; j < net_size - 1; j++)
-                Anew[IDX2C(i, j, net_size)] = (A[IDX2C(i + 1, j, net_size)] + A[IDX2C(i - 1, j, net_size)]
-                                            + A[IDX2C(i, j - 1, net_size)] + A[IDX2C(i, j + 1, net_size)]) * 0.25;
-        // swap(A, Anew)
-        temp = A, A = Anew, Anew = temp;
-        // Проверить ошибку
-        if (update_flag)
+        // Сначала посчитать net_size раз матрицы, после один раз посчитать ошибку
+        for (uint32_t k = 0; k < net_size; ++k)
         {
-            // зануление ошибки на GPU
-            #pragma acc kernels present(error)
-            error = 0;
-            #pragma acc data present(A, Anew) deviceptr(Adif)
-            {
-                #pragma acc host_data use_device(A, Anew)
-                {
-                    // Adif = Anew
-                    CUBLAS_CHECK(cublascopy(handle, vec_size, Anew, inc, Adif, inc));
-                    // Adif = -1 * A + Adif 
-                    CUBLAS_CHECK(cublasaxpy(handle, vec_size, &alpha, A, inc, Adif, inc));
-                    // Получить индекс максимального абсолютного значения в Adif
-                    CUBLAS_CHECK(cublasIamax(handle, vec_size, Adif, inc, &max_idx));
-
-                    #pragma acc kernels present(error)
-                    error = fabs(Adif[max_idx - 1]); // Fortran moment
-                }
-            }
-            // Обновление ошибки на хосте
-            #pragma acc update host(error) wait(1)
-            // Если ошибка не превышает точность, прекратить выполнение цикла
-            if (error <= accuracy)
-                break;
+            #pragma acc kernels loop independent collapse(2) present(A, Anew) async
+            for (uint32_t i = 1; i < net_size - 1; i++)
+                for (uint32_t j = 1; j < net_size - 1; j++)
+                    Anew[IDX2C(j, i, net_size)] = (A[IDX2C(j + 1, i, net_size)] + A[IDX2C(j - 1, i, net_size)]
+                                                + A[IDX2C(j, i - 1, net_size)] + A[IDX2C(j, i + 1, net_size)]) * 0.25;
+            
+            // swap(A, Anew)
+            temp = A; A = Anew; Anew = temp;
         }
+        #pragma acc wait
+        #pragma acc data present(A, Anew, Adif) async
+        #pragma acc host_data use_device(A, Anew, Adif)
+        {
+            // Adif = Anew
+            CUBLAS_CHECK(cublascopy(handle, vec_size, Anew, inc, Adif, inc));
+            // Adif = -1 * A + Adif 
+            CUBLAS_CHECK(cublasaxpy(handle, vec_size, &alpha, A, inc, Adif, inc));
+            // Получить индекс максимального абсолютного значения в Adif
+            CUBLAS_CHECK(cublasIamax(handle, vec_size, Adif, inc, &max_idx));
+        }
+        #pragma acc update host(Adif[max_idx - 1])
+            error = fabs(Adif[max_idx - 1]); // Fortran moment
     }
-    // Синхронизация
-    #pragma acc wait(1)
-    acc_free(Adif);
-    
-    #ifdef _NVTX
-        nvtxRangePop();
-    #endif
-    std::cout.precision(2);
-    if (res)
-    {
-        std::cout << "--Result--" << std::endl;
-        print_array(Anew, net_size);
-    }
-    std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
-
+    #pragma acc wait
+    std::cout << "Iter: " << iter << " Error: " << error << std::endl;
+	if (res)
+		print_array_gpu(A, net_size);
+        
+	#pragma acc exit data delete(A[:vec_size], Anew[:vec_size], Adif[:vec_size])
     cublasDestroy(handle);
-    #pragma acc exit data delete (A[:vec_size], Anew[:vec_size], error)
+
     delete[] A;
     delete[] Anew;
+    delete[] Adif;
 }
 
 int main(int argc, char *argv[])
 {
+	// Начать отсчет времени работы
     auto begin_main = std::chrono::steady_clock::now();
+
+	// Парсинг аргументов командной строки
     int net_size = 128, iter_max = (int)1e6;
     T accuracy = 1e-6;
     bool res = false;
@@ -209,12 +186,16 @@ int main(int argc, char *argv[])
                 net_size = std::stoi(argv[arg]);
             else
             {
-                std::cout << "Wrong args!";
+                std::cout << "Wrong args!\n";
                 return -1;
             }
         }
     }
+
+	// Заупстить решение задачи
     calculate(net_size, iter_max, accuracy, res);
+
+	// Посчитать время выполнения
     auto end_main = std::chrono::steady_clock::now();
     int time_spent_main = std::chrono::duration_cast<std::chrono::milliseconds>(end_main - begin_main).count();
     std::cout << "The elapsed time is:\nmain\t\t\t" << time_spent_main << " ms\n";

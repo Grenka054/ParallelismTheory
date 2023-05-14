@@ -1,6 +1,8 @@
-#include <chrono>
-#include <cmath>
 #include <iostream>
+#include <cstring>
+#include <cmath>
+#include <chrono>
+#include <openacc.h>
 
 #ifdef _FLOAT
     #define T float
@@ -12,141 +14,118 @@
     #define STOD std::stod
 #endif
 
-// Вывести значения двумерного массива
-void print_array(T **A, int size)
+// Макрос индексации с 0
+#define IDX2C(i, j, ld) (((j)*(ld))+(i))
+
+// Вывести значения двумерного массива на gpu
+void print_array_gpu(T *A, int size)
 {
     for (int i = 0; i < size; ++i)
     {
         for (int j = 0; j < size; ++j)
         {
-            // Значение с GPU
             #pragma acc kernels present(A)
-            printf("%.2f\t", A[i][j]);
+            printf("%.2f\t", A[IDX2C(i, j, size)]);
         }
-        std::cout << std::endl;
+        printf("\n");
     }
-    std::cout << std::endl;
+    printf("\n");
 }
 
 // Инициализация матрицы, чтобы подготовить ее к основному алгоритму
-void initialize_array(T **A, int size)
+void initialize_array(T *A, int size)
 {
-    // Инициализируется матрица на GPU
-    #pragma acc parallel present(A)
+    // Заполнение углов матрицы значениями
+    A[IDX2C(0, 0, size)] = 10.0;
+    A[IDX2C(0, size - 1, size)] = 20.0;
+    A[IDX2C(size - 1, 0, size)] = 20.0;
+    A[IDX2C(size - 1, size - 1, size)] = 30.0;
+
+    // Заполнение периметра матрицы
+    T step = 10.0 / (size - 1);
+
+    for (int i = 1; i < size - 1; ++i)
     {
-        // Заполнение углов матрицы значениями
-        A[0][0] = 10.0;
-        A[0][size - 1] = 20.0;
-        A[size - 1][size - 1] = 30.0;
-        A[size - 1][0] = 20.0;
-
-        // Заполнение периметра матрицы
-        T step = 10.0 / (size - 1);
-        #pragma acc loop independent
-        for (int i = 1; i < size - 1; ++i)
-        {
-            T addend = step * i;
-            A[0][i] = A[0][0] + addend;               // horizontal
-            A[size - 1][i] = A[size - 1][0] + addend; // horizontal
-            A[i][0] = A[0][0] + addend;               // vertical
-            A[i][size - 1] = A[0][size - 1] + addend; // vertical
-        }
-
-        // Заполнение 20-ю, чтобы сократить количество операций в основном алгоритме
-        #pragma acc loop independent collapse(2)
-        for (int i = 1; i < size - 1; ++i)
-            for (int j = 1; j < size - 1; ++j)
-                A[i][j] = 20.0;
+        T addend = step * i;
+        A[IDX2C(0, i, size)] = A[IDX2C(0, 0, size)] + addend;                 // horizontal
+        A[IDX2C(size - 1, i, size)] = A[IDX2C(size - 1, 0, size)] + addend;   // horizontal
+        A[IDX2C(i, 0, size)] = A[IDX2C(0, 0, size)] + addend;                 // vertical
+        A[IDX2C(i, size - 1, size)] = A[IDX2C(0, size - 1, size)] + addend;   // vertical
     }
 }
 
-// Очистка динамической памяти, выделенной под двумерую матрицу
-void delete_2d_array(T **A, int size)
+void calculate(const int net_size = 128, const int iter_max = 1e6, const T accuracy = 1e-6, const bool res = false)
 {
-    for (int i = 0; i < size; i++)
-        delete[] A[i];
-    delete[] A;
-}
+	const size_t vec_size = net_size * net_size;
 
-// Основной алгоритм
-void calculate(int net_size = 128, int iter_max = 1e6, T accuracy = 1e-6, bool res = false)
-{
-    // Создание 2-х двумерных матриц, одна будет считаться на основе другой
-    T **Anew = new T *[net_size],
-      **A = new T *[net_size];
-    for (int i = 0; i < net_size; i++)
-    {
-        A[i] = new T[net_size];
-        Anew[i] = new T[net_size];
-    }
+	// Создание 2-х двумерных матриц, одна будет считаться на основе другой
+  	T* A = new T[vec_size],
+	*Anew = new T[vec_size];
 
-    #pragma acc enter data create(A[:net_size][:net_size], Anew[:net_size][:net_size])
+	// Инициализация матриц
+	std::memset(A, 0, vec_size * sizeof(T));
+	initialize_array(A, net_size);
+	std::memcpy(Anew, A, vec_size * sizeof(T));
 
-    // Инициализация матриц
-    initialize_array(A, net_size);
-    initialize_array(Anew, net_size);
-    
-    // Текущая ошибка
-    T error = 0;
-    // Счетчик итераций
-    int iter;
+	// Текущая ошибка
+    T error = accuracy + 1;
+
     // Указатель для swap
-    T **temp;
-    // Флаг обновления ошибки на хосте для обработки условием цикла
-    bool update_flag = true;
+    T *temp;
 
+	// Счетчик итераций
+    int iter = 0;
+
+	// Скопировать данные на девайс
+	#pragma acc enter data copyin(A[:vec_size], Anew[:vec_size])
     #pragma acc data copy(error)
     {
-        for (iter = 0; iter < iter_max; ++iter)
-        {
-            // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
-            update_flag = !(iter % net_size);
+		for (iter = 0; iter < iter_max && error > accuracy; iter += net_size)
+		{
+			// Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
+			// Сначала посчитать net_size раз матрицы, после один раз посчитать ошибку
+			for (uint32_t k = 0; k < net_size; ++k)
+			{
+				#pragma acc kernels loop independent collapse(2) present(A, Anew) async
+				for (uint32_t i = 1; i < net_size - 1; i++)
+					for (uint32_t j = 1; j < net_size - 1; j++)
+						Anew[IDX2C(j, i, net_size)] = (A[IDX2C(j + 1, i, net_size)] + A[IDX2C(j - 1, i, net_size)]
+													+ A[IDX2C(j, i - 1, net_size)] + A[IDX2C(j, i + 1, net_size)]) * 0.25;
+				
+				// swap(A, Anew)
+				temp = A; A = Anew; Anew = temp;
+			}
 
-            if (update_flag)
-            {
-                // зануление ошибки на GPU
-                #pragma acc kernels
+ 			// зануление ошибки на GPU
+            #pragma acc kernels 
                 error = 0;
-            }
 
-            // Распараллелить циклы с редукцией и запустить асинхронные ядра
-            #pragma acc kernels loop independent collapse(2) reduction(max : error) present(A, Anew) async(1)
-            for (int i = 1; i < net_size - 1; i++)
-                for (int j = 1; j < net_size - 1; j++)
-                    Anew[i][j] = (A[i + 1][j] + A[i - 1][j] + A[i][j - 1] + A[i][j + 1]) * 0.25;
-
-            // swap(A, Anew)
-            temp = A, A = Anew, Anew = temp;
-            // Проверить ошибку
-            if (update_flag)
-            {
-                for (int i = 1; i < net_size - 1; i++)
-                    for (int j = 1; j < net_size - 1; j++)
-                        // Пересчитать ошибку
-                        error = std::max(error, std::abs(Anew[i][j] - A[i][j]));
-                // Синхронизация и обновление ошибки на хосте
-                #pragma acc update host(error) wait(1)
-                // Если ошибка не превышает точность, прекратить выполнение цикла
-                if (error <= accuracy)
-                    break;
-            }
-        }
-        // Синхронизация
-        #pragma acc wait(1)
+			// Распараллелить циклы с редукцией
+			#pragma acc parallel loop independent collapse(2) reduction(max:error) async
+			for (uint32_t i = 1; i < net_size - 1; i++)
+				for (uint32_t j = 1; j < net_size - 1; j++)
+					error = MAX(error, fabs(Anew[i * net_size + j] - A[i * net_size + j]));
+			
+			// Обновление ошибки на хосте
+            #pragma acc update host(error) wait
+		}
     }
-    std::cout.precision(2);
-    if (res)
-        print_array(A, net_size);
-    std::cout << "iter=" << iter << ",\terror=" << error << std::endl;
 
-    #pragma acc exit data delete (A[:net_size][:net_size], Anew[:net_size][:net_size])
-    delete_2d_array(A, net_size);
-    delete_2d_array(Anew, net_size);
+    std::cout << "Iter: " << iter << " Error: " << error << std::endl;
+	if (res)
+		print_array_gpu(A, net_size);
+	#pragma acc exit data delete(A[:vec_size], Anew[:vec_size])
+
+    delete[] A;
+    delete[] Anew;
 }
 
 int main(int argc, char *argv[])
 {
+	// Начать отсчет времени работы
     auto begin_main = std::chrono::steady_clock::now();
+
+	// Парсинг аргументов командной строки
     int net_size = 128, iter_max = (int)1e6;
     T accuracy = 1e-6;
     bool res = false;
@@ -166,12 +145,16 @@ int main(int argc, char *argv[])
                 net_size = std::stoi(argv[arg]);
             else
             {
-                std::cout << "Wrong args!";
+                std::cout << "Wrong args!\n";
                 return -1;
             }
         }
     }
+
+	// Заупстить решение задачи
     calculate(net_size, iter_max, accuracy, res);
+
+	// Посчитать время выполнения
     auto end_main = std::chrono::steady_clock::now();
     int time_spent_main = std::chrono::duration_cast<std::chrono::milliseconds>(end_main - begin_main).count();
     std::cout << "The elapsed time is:\nmain\t\t\t" << time_spent_main << " ms\n";
