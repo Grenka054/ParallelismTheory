@@ -99,8 +99,8 @@ void initialize_array(T *A, int size)
 // Посчитать матрицу
 __global__ void calculate_matrix(T *Anew, T *A, uint32_t size)
 {
-    uint32_t i = blockIdx.x;
-    uint32_t j = threadIdx.x;
+    uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+    uint32_t j = blockDim.y * blockIdx.y + threadIdx.y;
 
     // Граница или выход за границы массива - ничего не делать
     if (i >= size - 1 || j >= size - 1 || i == 0 || j == 0)
@@ -112,8 +112,8 @@ __global__ void calculate_matrix(T *Anew, T *A, uint32_t size)
 // O = |A-B|
 __global__ void count_matrix_difference(T *matrixA, T *matrixB, T *outputMatrix, uint32_t size)
 {
-    uint32_t i = blockIdx.x ;
-    uint32_t j = threadIdx.x;
+    uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+    uint32_t j = blockDim.y * blockIdx.y + threadIdx.y;
 
     // Выход за границы массива или периметр - ничего не делать
     if (i >= size - 1 || j >= size - 1 || i == 0 || j == 0)
@@ -128,8 +128,10 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
     CUDA_CHECK(cudaSetDevice(1));
     const size_t vec_size = net_size * net_size;
 
-    uint32_t threadPerBlock = 512;                      // Потоков в одном блоке (32 * 32 максимум)
-    uint32_t blockPerGrid = 512; // Блоков в сетке (size / 32 максимум)
+    uint32_t threads_in_block = MIN(net_size, 32);                      // Потоков в одном блоке (32 * 32 максимум)
+    uint32_t block_in_grid = ceil((double)net_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
+
+    dim3 blockPerGrid = dim3(block_in_grid,block_in_grid), threadPerBlock = dim3(threads_in_block,threads_in_block);
 
     // Матрица на хосте (нужна только для инициализации и вывода) [Pinned]
     T *A;
@@ -149,8 +151,8 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
     CUDA_CHECK(cudaStreamCreate(&memory_stream));
 
     // Скопировать матрицу с хоста на матрицы на девайсе
-    CUDA_CHECK(cudaMemcpy(A_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(Anew_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(A_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice, memory_stream));
+    CUDA_CHECK(cudaMemcpyAsync(Anew_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice, memory_stream));
 
     // Текущая ошибка
     T *error, *error_dev;
