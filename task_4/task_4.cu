@@ -151,8 +151,8 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
     CUDA_CHECK(cudaStreamCreate(&memory_stream));
 
     // Скопировать матрицу с хоста на матрицы на девайсе
-    CUDA_CHECK(cudaMemcpyAsync(A_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice, memory_stream));
-    CUDA_CHECK(cudaMemcpyAsync(Anew_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice, memory_stream));
+    CUDA_CHECK(cudaMemcpy(A_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(Anew_dev, A, sizeof(T) * vec_size, cudaMemcpyHostToDevice));
 
     // Текущая ошибка
     T *error, *error_dev;
@@ -174,8 +174,33 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
     // Выделение памяти под буфер
     CUDA_CHECK(cudaMalloc(&reduction_bufer, reduction_bufer_size));
 
-    // Указатель для swap
-    T *temp;
+    // Граф
+    cudaGraph_t graph;
+    cudaGraphExec_t instance;
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+
+    // Сокращение количества обращений к CPU. Больше сетка - реже стоит сверять значения.
+    uint32_t num_skipped_checks = (iter_max < net_size) ? iter_max : net_size;
+    num_skipped_checks += num_skipped_checks % 2; // Привести к четному числу
+
+    for (uint32_t k = 0; k < num_skipped_checks; k += 2)
+    {
+        calculate_matrix<<<blockPerGrid, threadPerBlock, 0, stream>>>(A_dev, Anew_dev, net_size);
+        calculate_matrix<<<blockPerGrid, threadPerBlock, 0, stream>>>(Anew_dev, A_dev, net_size);
+        // swap не работает
+    }
+
+    count_matrix_difference<<<blockPerGrid, threadPerBlock, 0, stream>>>(A_dev, Anew_dev, A_err, net_size);
+   
+    // Найти максимум и положить в error_dev - аналог reduction (max : error_dev) в OpenACC
+    cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err, error_dev, vec_size, stream);
+
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&instance, graph, NULL, NULL, 0));
 
     // Счетчик итераций
     int iter = 0;
@@ -184,24 +209,18 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
     // if (res)
     //    print_array_gpu(A, net_size);
 
-    for (iter = 0; iter < iter_max && *error > accuracy; iter += net_size)
+    for (iter = 0; iter < iter_max && *error > accuracy; iter += num_skipped_checks)
     {
-        for (uint32_t k = 0; k < net_size; ++k)
-        {
-            calculate_matrix<<<blockPerGrid, threadPerBlock>>>(Anew_dev, A_dev, net_size);
+        // Запуск графа
+        CUDA_CHECK(cudaGraphLaunch(instance, stream));
 
-            // swap(A_dev, Anew_dev)
-            temp = A_dev, A_dev = Anew_dev, Anew_dev = temp;
-        }
-        
-        count_matrix_difference<<<blockPerGrid, threadPerBlock>>>(A_dev, Anew_dev, A_err, net_size);
-
-        // Найти максимум и положить в error_dev - аналог reduction (max : error_dev) в OpenACC
-        cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err, error_dev, vec_size);
+        // Синхронизация потока
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // Копировать ошибку с девайса на хост
-        cudaMemcpy(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost);  
+        CUDA_CHECK(cudaMemcpy(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost));
     }
+
     std::cout << "Iter: " << iter << " Error: " << *error << std::endl;
 
     // Вывод
@@ -218,6 +237,10 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
     CUDA_CHECK(cudaFree(Anew_dev));
     CUDA_CHECK(cudaFreeHost(A));
     CUDA_CHECK(cudaFreeHost(error));
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaStreamDestroy(memory_stream));
+    CUDA_CHECK(cudaGraphDestroy(graph));
 }
 
 int main(int argc, char *argv[])
