@@ -99,28 +99,25 @@ void initialize_array(T *A, int size)
 // Посчитать матрицу
 __global__ void calculate_matrix(T *Anew, T *A, uint32_t size)
 {
-    uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
-    uint32_t j = blockDim.y * blockIdx.y + threadIdx.y;
+    uint64_t i = blockDim.x * blockIdx.x + threadIdx.x;
 
     // Граница или выход за границы массива - ничего не делать
-    if (i >= size - 1 || j >= size - 1 || i == 0 || j == 0)
+    if (i % size == 0 || (i + 1) % size == 0 || i >= size * (size - 1) || i < size)
         return;
 
-    Anew[IDX2C(i, j, size)] = (A[IDX2C(i + 1, j, size)] + A[IDX2C(i - 1, j, size)] + A[IDX2C(i, j - 1, size)] + A[IDX2C(i, j + 1, size)]) * 0.25;
+    Anew[i] = (A[i + size] + A[i - size] + A[i + 1] + A[i - 1]) * 0.25;
 }
 
 // O = |A-B|
 __global__ void count_matrix_difference(T *matrixA, T *matrixB, T *outputMatrix, uint32_t size)
 {
-    uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
-    uint32_t j = blockDim.y * blockIdx.y + threadIdx.y;
+    uint64_t i = blockDim.x * blockIdx.x + threadIdx.x;
 
     // Выход за границы массива или периметр - ничего не делать
-    if (i >= size - 1 || j >= size - 1 || i == 0 || j == 0)
+    if (i % size == 0 || (i + 1) % size == 0 || i >= size * (size - 1) || i < size)
         return;
 
-    uint32_t idx = IDX2C(i, j, size);
-    outputMatrix[idx] = std::abs(matrixB[idx] - matrixA[idx]);
+    outputMatrix[i] = std::abs(matrixB[i] - matrixA[i]);
 }
 
 void calculate(const int net_size = 128, const int iter_max = 1e6, const T accuracy = 1e-6, const bool res = false)
@@ -128,10 +125,10 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
     CUDA_CHECK(cudaSetDevice(1));
     const size_t vec_size = net_size * net_size;
 
-    uint32_t threads_in_block = MIN(net_size, 32);                      // Потоков в одном блоке (32 * 32 максимум)
-    uint32_t block_in_grid = ceil((double)net_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
+    uint32_t threads_in_block = 1024;                      // Потоков в одном блоке (32 * 32 максимум)
+    uint32_t block_in_grid = ceil((double)vec_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
 
-    dim3 blockPerGrid = dim3(block_in_grid,block_in_grid), threadPerBlock = dim3(threads_in_block,threads_in_block);
+    dim3 blockPerGrid = dim3(block_in_grid), threadPerBlock = dim3(threads_in_block);
 
     // Матрица на хосте (нужна только для инициализации и вывода) [Pinned]
     T *A;
