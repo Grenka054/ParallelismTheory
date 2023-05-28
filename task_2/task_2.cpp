@@ -58,6 +58,8 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
 {
 	const size_t vec_size = net_size * net_size;
 
+    acc_set_device_num(2,acc_device_default);
+
 	// Создание 2-х двумерных матриц, одна будет считаться на основе другой
   	T* A = new T[vec_size],
 	*Anew = new T[vec_size];
@@ -75,6 +77,9 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
 
 	// Счетчик итераций
     int iter = 0;
+
+    // Начать отсчет времени работы
+    auto begin_main = std::chrono::steady_clock::now();
 
 	// Скопировать данные на девайс
 	#pragma acc enter data copyin(A[:vec_size], Anew[:vec_size])
@@ -110,10 +115,18 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
             #pragma acc update host(error) wait
 		}
     }
+    
+    // Посчитать время выполнения
+    auto end_main = std::chrono::steady_clock::now();
+    int time_spent = std::chrono::duration_cast<std::chrono::milliseconds>(end_main - begin_main).count();
 
     std::cout << "Iter: " << iter << " Error: " << error << std::endl;
+
 	if (res)
 		print_array_gpu(A, net_size);
+
+    std::cout << "Time:\t\t" << time_spent << " ms\n";
+
 	#pragma acc exit data delete(A[:vec_size], Anew[:vec_size])
 
     delete[] A;
@@ -122,9 +135,6 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
 
 int main(int argc, char *argv[])
 {
-	// Начать отсчет времени работы
-    auto begin_main = std::chrono::steady_clock::now();
-
 	// Парсинг аргументов командной строки
     int net_size = 128, iter_max = (int)1e6;
     T accuracy = 1e-6;
@@ -151,12 +161,8 @@ int main(int argc, char *argv[])
         }
     }
 
-	// Заупстить решение задачи
+	// Запустить решение задачи
     calculate(net_size, iter_max, accuracy, res);
 
-	// Посчитать время выполнения
-    auto end_main = std::chrono::steady_clock::now();
-    int time_spent_main = std::chrono::duration_cast<std::chrono::milliseconds>(end_main - begin_main).count();
-    std::cout << "The elapsed time is:\nmain\t\t\t" << time_spent_main << " ms\n";
     return 0;
 }

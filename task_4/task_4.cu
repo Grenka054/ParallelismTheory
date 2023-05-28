@@ -32,8 +32,6 @@
 // Макрос индексации с 0
 #define IDX2C(i, j, ld) (((j) * (ld)) + (i))
 
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
-
 // Макрос проверки статуса операции CUDA
 #define CUDA_CHECK(err)                                                        \
     {                                                                          \
@@ -125,10 +123,10 @@ __global__ void count_matrix_difference(T *matrixA, T *matrixB, T *outputMatrix,
 
 void calculate(const int net_size = 128, const int iter_max = 1e6, const T accuracy = 1e-6, const bool res = false)
 {
-    CUDA_CHECK(cudaSetDevice(1));
+    CUDA_CHECK(cudaSetDevice(2));
     const size_t vec_size = net_size * net_size;
 
-    uint32_t threads_in_block = MIN(net_size, 32);                      // Потоков в одном блоке (32 * 32 максимум)
+    uint32_t threads_in_block = 32;                      // Потоков в одном блоке (32 * 32 максимум)
     uint32_t block_in_grid = ceil((double)net_size / threads_in_block); // Блоков в сетке (size / 32 максимум)
 
     dim3 blockPerGrid = dim3(block_in_grid,block_in_grid), threadPerBlock = dim3(threads_in_block,threads_in_block);
@@ -209,6 +207,9 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
     // if (res)
     //    print_array_gpu(A, net_size);
 
+    // Начать отсчет времени работы
+    auto begin_main = std::chrono::steady_clock::now();
+
     for (iter = 0; iter < iter_max && *error > accuracy; iter += num_skipped_checks)
     {
         // Запуск графа
@@ -221,7 +222,13 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
         CUDA_CHECK(cudaMemcpy(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost));
     }
 
+    // Посчитать время выполнения
+    auto end_main = std::chrono::steady_clock::now();
+    int time_spent = std::chrono::duration_cast<std::chrono::milliseconds>(end_main - begin_main).count();
+
     std::cout << "Iter: " << iter << " Error: " << *error << std::endl;
+
+    std::cout << "Time:\t\t" << time_spent << " ms\n";
 
     // Вывод
     if (res)
@@ -245,9 +252,6 @@ void calculate(const int net_size = 128, const int iter_max = 1e6, const T accur
 
 int main(int argc, char *argv[])
 {
-    // Начать отсчет времени работы
-    auto begin_main = std::chrono::steady_clock::now();
-
     // Парсинг аргументов командной строки
     int net_size = 128, iter_max = (int)1e6;
     T accuracy = 1e-6;
@@ -274,12 +278,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Заупстить решение задачи
+    // Запустить решение задачи
     calculate(net_size, iter_max, accuracy, res);
 
-    // Посчитать время выполнения
-    auto end_main = std::chrono::steady_clock::now();
-    int time_spent_main = std::chrono::duration_cast<std::chrono::milliseconds>(end_main - begin_main).count();
-    std::cout << "The elapsed time is:\nmain\t\t\t" << time_spent_main << " ms\n";
     return 0;
 }
